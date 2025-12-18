@@ -297,15 +297,39 @@ func (d *Database) CreateContactsAndConversations(
 			log.Printf("CreateContactsAndConversations: Failed to scan row: %v", err)
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
-		result[fk.PhoneNumber] = &fk
+		// Se já existe uma entrada para este phone_number, verificar qual conversation_id usar
+		// Preferir a conversa existente (não zero) sobre uma nova
+		if existing, exists := result[fk.PhoneNumber]; exists {
+			if existing.ConversationID == 0 && fk.ConversationID != 0 {
+				// Substituir se a nova tem conversa e a antiga não
+				result[fk.PhoneNumber] = &fk
+				log.Printf("CreateContactsAndConversations: Updated FK for phone %s: using conversation_id=%d (was %d)", 
+					fk.PhoneNumber, fk.ConversationID, existing.ConversationID)
+			} else if fk.ConversationID != 0 && existing.ConversationID != 0 {
+				// Ambas têm conversa - usar a mais recente (maior ID)
+				if fk.ConversationID > existing.ConversationID {
+					result[fk.PhoneNumber] = &fk
+					log.Printf("CreateContactsAndConversations: Updated FK for phone %s: using newer conversation_id=%d (was %d)", 
+						fk.PhoneNumber, fk.ConversationID, existing.ConversationID)
+				} else {
+					log.Printf("CreateContactsAndConversations: Skipping duplicate FK for phone %s: keeping conversation_id=%d (ignoring %d)", 
+						fk.PhoneNumber, existing.ConversationID, fk.ConversationID)
+				}
+			} else {
+				log.Printf("CreateContactsAndConversations: Skipping duplicate FK for phone %s: keeping existing entry", fk.PhoneNumber)
+			}
+		} else {
+			result[fk.PhoneNumber] = &fk
+			log.Printf("CreateContactsAndConversations: Found FK for phone %s: contact_id=%d, conversation_id=%d", 
+				fk.PhoneNumber, fk.ContactID, fk.ConversationID)
+		}
 		rowCount++
-		log.Printf("CreateContactsAndConversations: Found FK for phone %s: contact_id=%d, conversation_id=%d", 
-			fk.PhoneNumber, fk.ContactID, fk.ConversationID)
 	}
 	
-	log.Printf("CreateContactsAndConversations: Query returned %d rows (expected %d contacts)", rowCount, len(contacts))
+	log.Printf("CreateContactsAndConversations: Query returned %d rows, %d unique contacts (expected %d contacts)", 
+		rowCount, len(result), len(contacts))
 	
-	if rowCount < len(contacts) {
+	if len(result) < len(contacts) {
 		// Identificar quais contatos não foram retornados
 		returnedPhones := make(map[string]bool)
 		for phone := range result {
@@ -361,8 +385,8 @@ func (d *Database) CreateContactsAndConversations(
 		}
 	}
 	
-	if rowCount == 0 && len(contacts) > 0 {
-		log.Printf("CreateContactsAndConversations: WARNING - No rows returned but %d contacts provided", len(contacts))
+	if len(result) == 0 && len(contacts) > 0 {
+		log.Printf("CreateContactsAndConversations: WARNING - No contacts returned but %d contacts provided", len(contacts))
 		log.Printf("CreateContactsAndConversations: This might mean all contacts already exist or query failed silently")
 	}
 
