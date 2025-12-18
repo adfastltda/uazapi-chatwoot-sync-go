@@ -36,7 +36,7 @@ O serviço é composto por:
 
 1. Clone o repositório:
 ```bash
-git clone <repository-url>
+git clone https://github.com/adfastltda/uazapi-chatwoot-sync-go.git
 cd chatwoot-sync-go
 ```
 
@@ -288,7 +288,7 @@ Verifique se:
 
 ## 📄 Licença
 
-Este projeto faz parte do Evolution API Pro.
+Sla, deixando os creditos ja ta bom.
 
 ## 🤝 Contribuindo
 
