@@ -226,17 +226,22 @@ func (d *Database) CreateContactsAndConversations(
 					to_timestamp(CASE WHEN p.created_at > 10000000000 THEN p.created_at / 1000 ELSE p.created_at END),
 					to_timestamp(CASE WHEN p.last_activity_at > 10000000000 THEN p.last_activity_at / 1000 ELSE p.last_activity_at END)
 				FROM only_new_phone_number AS p
-				ON CONFLICT(identifier, account_id) 
-				DO UPDATE SET 
-					name = COALESCE(NULLIF(TRIM(EXCLUDED.name), ''), contacts.name),
-					updated_at = EXCLUDED.updated_at
+				WHERE NOT EXISTS (
+					SELECT 1 FROM contacts 
+					WHERE identifier = CONCAT(REPLACE(p.phone_number, '+', ''), '@s.whatsapp.net')
+						AND account_id = $1
+				)
 				RETURNING id, phone_number, created_at, updated_at
 			),
 			new_contact_inbox AS (
 				INSERT INTO contact_inboxes (contact_id, inbox_id, source_id, created_at, updated_at)
 				SELECT new_contact.id, $2, gen_random_uuid(), new_contact.created_at, new_contact.updated_at
 				FROM new_contact 
-				ON CONFLICT (contact_id, inbox_id) DO UPDATE SET updated_at = NOW()
+				WHERE NOT EXISTS (
+					SELECT 1 FROM contact_inboxes 
+					WHERE contact_id = new_contact.id 
+						AND inbox_id = $2
+				)
 				RETURNING id, contact_id, created_at, updated_at
 			),
 			new_conversation AS (
@@ -256,31 +261,109 @@ func (d *Database) CreateContactsAndConversations(
 			SELECT new_contact.phone_number, new_conversation.contact_id, new_conversation.id AS conversation_id
 			FROM new_conversation 
 			JOIN new_contact ON new_conversation.contact_id = new_contact.id
-		UNION
-			SELECT p.phone_number, c.id contact_id, con.id conversation_id
+		UNION ALL
+			SELECT p.phone_number, c.id contact_id, COALESCE(con.id, 0) conversation_id
 			FROM phone_number p
-			JOIN contacts c ON c.phone_number = p.phone_number
-			JOIN contact_inboxes ci ON ci.contact_id = c.id AND ci.inbox_id = $2
-			JOIN conversations con ON con.contact_inbox_id = ci.id AND con.account_id = $1
-				AND con.inbox_id = $2 AND con.contact_id = c.id
+			JOIN contacts c ON c.phone_number = p.phone_number AND c.account_id = $1
+			LEFT JOIN contact_inboxes ci ON ci.contact_id = c.id AND ci.inbox_id = $2
+			LEFT JOIN conversations con ON con.contact_inbox_id = ci.id 
+				AND con.account_id = $1
+				AND con.inbox_id = $2 
+				AND con.contact_id = c.id
+			WHERE NOT EXISTS (
+				SELECT 1 FROM new_conversation WHERE new_conversation.contact_id = c.id
+			)
 	`, strings.Join(values, ","))
 
 	// Preparar argumentos: account_id, inbox_id, depois os valores
 	args = append([]interface{}{d.cfg.Chatwoot.AccountID, inboxID}, args...)
 
+	log.Printf("CreateContactsAndConversations: Executing query for %d contacts (account_id=%d, inbox_id=%d)", 
+		len(contacts), d.cfg.Chatwoot.AccountID, inboxID)
+
 	rows, err := d.db.Query(query, args...)
 	if err != nil {
+		log.Printf("CreateContactsAndConversations: Query failed: %v", err)
+		log.Printf("CreateContactsAndConversations: Query was: %s", query)
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
 	defer rows.Close()
 
 	result := make(map[string]*models.ChatwootFKs)
+	rowCount := 0
 	for rows.Next() {
 		var fk models.ChatwootFKs
 		if err := rows.Scan(&fk.PhoneNumber, &fk.ContactID, &fk.ConversationID); err != nil {
+			log.Printf("CreateContactsAndConversations: Failed to scan row: %v", err)
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
 		result[fk.PhoneNumber] = &fk
+		rowCount++
+		log.Printf("CreateContactsAndConversations: Found FK for phone %s: contact_id=%d, conversation_id=%d", 
+			fk.PhoneNumber, fk.ContactID, fk.ConversationID)
+	}
+	
+	log.Printf("CreateContactsAndConversations: Query returned %d rows (expected %d contacts)", rowCount, len(contacts))
+	
+	if rowCount < len(contacts) {
+		// Identificar quais contatos não foram retornados
+		returnedPhones := make(map[string]bool)
+		for phone := range result {
+			returnedPhones[phone] = true
+		}
+		
+		missingPhones := make([]string, 0)
+		for _, contact := range contacts {
+			if !returnedPhones[contact.PhoneNumber] {
+				missingPhones = append(missingPhones, contact.PhoneNumber)
+			}
+		}
+		
+		if len(missingPhones) > 0 {
+			log.Printf("CreateContactsAndConversations: WARNING - %d contacts not returned: %v", len(missingPhones), missingPhones)
+			log.Printf("CreateContactsAndConversations: These contacts may exist but don't have conversations, or query failed to match them")
+			
+			// Criar um mapa para buscar informações do contato
+			contactMap := make(map[string]models.ChatwootContact)
+			for _, contact := range contacts {
+				contactMap[contact.PhoneNumber] = contact
+			}
+			
+			// Tentar buscar manualmente os contatos faltantes
+			for _, missingPhone := range missingPhones {
+				log.Printf("CreateContactsAndConversations: Attempting to find contact manually for phone: %s", missingPhone)
+				manualFK, err := d.findContactManually(missingPhone, inboxID)
+				if err != nil {
+					log.Printf("CreateContactsAndConversations: Failed to find contact manually for %s: %v", missingPhone, err)
+				} else if manualFK != nil {
+					result[missingPhone] = manualFK
+					log.Printf("CreateContactsAndConversations: Found contact manually for %s: contact_id=%d, conversation_id=%d", 
+						missingPhone, manualFK.ContactID, manualFK.ConversationID)
+				} else {
+					// Contato não existe - criar agora
+					log.Printf("CreateContactsAndConversations: Contact %s does not exist, creating it now", missingPhone)
+					contactInfo, exists := contactMap[missingPhone]
+					if !exists {
+						log.Printf("CreateContactsAndConversations: WARNING - Contact info not found for %s, skipping", missingPhone)
+						continue
+					}
+					
+					createdFK, err := d.createContactAndConversation(contactInfo, inboxID)
+					if err != nil {
+						log.Printf("CreateContactsAndConversations: Failed to create contact for %s: %v", missingPhone, err)
+					} else {
+						result[missingPhone] = createdFK
+						log.Printf("CreateContactsAndConversations: Created contact for %s: contact_id=%d, conversation_id=%d", 
+							missingPhone, createdFK.ContactID, createdFK.ConversationID)
+					}
+				}
+			}
+		}
+	}
+	
+	if rowCount == 0 && len(contacts) > 0 {
+		log.Printf("CreateContactsAndConversations: WARNING - No rows returned but %d contacts provided", len(contacts))
+		log.Printf("CreateContactsAndConversations: This might mean all contacts already exist or query failed silently")
 	}
 
 	// Atualizar nomes dos contatos existentes que não têm nome ou têm apenas o número
@@ -317,6 +400,216 @@ func (d *Database) CreateContactsAndConversations(
 	}
 
 	return result, nil
+}
+
+// findContactManually busca um contato manualmente quando a query CTE não o retorna
+func (d *Database) findContactManually(phoneNumber string, inboxID int) (*models.ChatwootFKs, error) {
+	log.Printf("findContactManually: Searching for contact with phone_number='%s', account_id=%d, inbox_id=%d", 
+		phoneNumber, d.cfg.Chatwoot.AccountID, inboxID)
+	
+	// Primeiro, tentar buscar por phone_number
+	query := `
+		SELECT c.id, con.id
+		FROM contacts c
+		LEFT JOIN contact_inboxes ci ON ci.contact_id = c.id AND ci.inbox_id = $2
+		LEFT JOIN conversations con ON con.contact_inbox_id = ci.id 
+			AND con.account_id = $1
+			AND con.inbox_id = $2
+			AND con.contact_id = c.id
+		WHERE c.phone_number = $3
+			AND c.account_id = $1
+		LIMIT 1
+	`
+	
+	var contactID, conversationID sql.NullInt64
+	err := d.db.QueryRow(query, d.cfg.Chatwoot.AccountID, inboxID, phoneNumber).Scan(&contactID, &conversationID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			// Se não encontrou por phone_number, tentar buscar por identifier
+			identifier := strings.TrimPrefix(phoneNumber, "+") + "@s.whatsapp.net"
+			log.Printf("findContactManually: Contact not found by phone_number, trying identifier='%s'", identifier)
+			
+			queryByIdentifier := `
+				SELECT c.id, con.id
+				FROM contacts c
+				LEFT JOIN contact_inboxes ci ON ci.contact_id = c.id AND ci.inbox_id = $2
+				LEFT JOIN conversations con ON con.contact_inbox_id = ci.id 
+					AND con.account_id = $1
+					AND con.inbox_id = $2
+					AND con.contact_id = c.id
+				WHERE c.identifier = $3
+					AND c.account_id = $1
+				LIMIT 1
+			`
+			
+			err = d.db.QueryRow(queryByIdentifier, d.cfg.Chatwoot.AccountID, inboxID, identifier).Scan(&contactID, &conversationID)
+			if err != nil {
+				if err == sql.ErrNoRows {
+					log.Printf("findContactManually: Contact with phone_number='%s' or identifier='%s' not found in database", phoneNumber, identifier)
+					return nil, nil // Contato não existe
+				}
+				log.Printf("findContactManually: Error querying contact by identifier: %v", err)
+				return nil, fmt.Errorf("failed to query contact: %w", err)
+			}
+		} else {
+			log.Printf("findContactManually: Error querying contact: %v", err)
+			return nil, fmt.Errorf("failed to query contact: %w", err)
+		}
+	}
+	
+	if !contactID.Valid {
+		log.Printf("findContactManually: ContactID is not valid for phone_number='%s'", phoneNumber)
+		return nil, nil // Contato não encontrado
+	}
+	
+	log.Printf("findContactManually: Found contact_id=%d for phone_number='%s'", contactID.Int64, phoneNumber)
+	
+	fk := &models.ChatwootFKs{
+		PhoneNumber:   phoneNumber,
+		ContactID:     int(contactID.Int64),
+		ConversationID: 0,
+	}
+	
+	if conversationID.Valid {
+		fk.ConversationID = int(conversationID.Int64)
+		log.Printf("findContactManually: Contact %d already has conversation_id=%d", fk.ContactID, fk.ConversationID)
+	} else {
+			// Contato existe mas não tem conversa - criar conversa
+			log.Printf("findContactManually: Contact %d exists but has no conversation, creating one", fk.ContactID)
+			
+			// Buscar ou criar contact_inbox
+			var contactInboxID sql.NullInt64
+			ciQuery := `SELECT id FROM contact_inboxes WHERE contact_id = $1 AND inbox_id = $2 LIMIT 1`
+			err = d.db.QueryRow(ciQuery, fk.ContactID, inboxID).Scan(&contactInboxID)
+			if err != nil && err != sql.ErrNoRows {
+				return nil, fmt.Errorf("failed to query contact_inbox: %w", err)
+			}
+			
+			if !contactInboxID.Valid {
+				// Criar contact_inbox
+				ciInsert := `INSERT INTO contact_inboxes (contact_id, inbox_id, source_id, created_at, updated_at) 
+					VALUES ($1, $2, gen_random_uuid(), NOW(), NOW()) RETURNING id`
+				err = d.db.QueryRow(ciInsert, fk.ContactID, inboxID).Scan(&contactInboxID)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create contact_inbox: %w", err)
+				}
+				log.Printf("findContactManually: Created contact_inbox %d for contact %d", contactInboxID.Int64, fk.ContactID)
+			}
+			
+			// Verificar se já existe conversa
+			var existingConvID sql.NullInt64
+			convCheck := `SELECT id FROM conversations WHERE contact_inbox_id = $1 AND account_id = $2 AND inbox_id = $3 LIMIT 1`
+			err = d.db.QueryRow(convCheck, contactInboxID.Int64, d.cfg.Chatwoot.AccountID, inboxID).Scan(&existingConvID)
+			if err != nil && err != sql.ErrNoRows {
+				return nil, fmt.Errorf("failed to check conversation: %w", err)
+			}
+			
+			if existingConvID.Valid {
+				fk.ConversationID = int(existingConvID.Int64)
+				log.Printf("findContactManually: Found existing conversation %d for contact %d", fk.ConversationID, fk.ContactID)
+			} else {
+				// Criar conversa
+				convInsert := `INSERT INTO conversations (account_id, inbox_id, status, contact_id, contact_inbox_id, uuid, last_activity_at, created_at, updated_at)
+					VALUES ($1, $2, 0, $3, $4, gen_random_uuid(), NOW(), NOW(), NOW()) RETURNING id`
+				err = d.db.QueryRow(convInsert, d.cfg.Chatwoot.AccountID, inboxID, fk.ContactID, contactInboxID.Int64).Scan(&conversationID)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create conversation: %w", err)
+				}
+				
+				fk.ConversationID = int(conversationID.Int64)
+				log.Printf("findContactManually: Created conversation %d for contact %d", fk.ConversationID, fk.ContactID)
+		}
+	}
+	
+	log.Printf("findContactManually: Returning FK for phone_number='%s': contact_id=%d, conversation_id=%d", 
+		phoneNumber, fk.ContactID, fk.ConversationID)
+	return fk, nil
+}
+
+// createContactAndConversation cria um contato e sua conversa quando ele não existe
+func (d *Database) createContactAndConversation(contact models.ChatwootContact, inboxID int) (*models.ChatwootFKs, error) {
+	log.Printf("createContactAndConversation: Creating contact for phone_number='%s', name='%s'", contact.PhoneNumber, contact.Name)
+	
+	// Converter timestamps
+	createdAt := contact.FirstTimestamp
+	if createdAt > 10000000000 {
+		createdAt = createdAt / 1000
+	}
+	updatedAt := contact.LastTimestamp
+	if updatedAt > 10000000000 {
+		updatedAt = updatedAt / 1000
+	}
+	
+	// Criar contato
+	contactName := contact.Name
+	if contactName == "" {
+		contactName = strings.TrimPrefix(contact.PhoneNumber, "+")
+	}
+	
+	identifier := contact.Identifier
+	if identifier == "" {
+		identifier = strings.TrimPrefix(contact.PhoneNumber, "+") + "@s.whatsapp.net"
+	}
+	
+	// Verificar se o contato já existe pelo identifier (devido à constraint única)
+	var existingContactID sql.NullInt64
+	checkQuery := `SELECT id FROM contacts WHERE identifier = $1 AND account_id = $2 LIMIT 1`
+	err := d.db.QueryRow(checkQuery, identifier, d.cfg.Chatwoot.AccountID).Scan(&existingContactID)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to check existing contact: %w", err)
+	}
+	
+	var contactID int64
+	if existingContactID.Valid {
+		// Contato já existe pelo identifier, usar o existente
+		contactID = existingContactID.Int64
+		log.Printf("createContactAndConversation: Contact already exists with identifier='%s', using contact_id=%d", identifier, contactID)
+		
+		// Atualizar phone_number se necessário
+		updateQuery := `UPDATE contacts SET phone_number = $1, name = COALESCE(NULLIF(TRIM($2), ''), name) WHERE id = $3`
+		_, err = d.db.Exec(updateQuery, contact.PhoneNumber, contactName, contactID)
+		if err != nil {
+			log.Printf("createContactAndConversation: Warning - failed to update contact phone_number: %v", err)
+		}
+	} else {
+		// Criar novo contato
+		contactInsert := `
+			INSERT INTO contacts (name, phone_number, account_id, identifier, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, to_timestamp($5), to_timestamp($6))
+			RETURNING id
+		`
+		err = d.db.QueryRow(contactInsert, contactName, contact.PhoneNumber, d.cfg.Chatwoot.AccountID, identifier, createdAt, updatedAt).Scan(&contactID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create contact: %w", err)
+		}
+		log.Printf("createContactAndConversation: Created contact_id=%d", contactID)
+	}
+	
+	// Criar contact_inbox
+	var contactInboxID int64
+	ciInsert := `INSERT INTO contact_inboxes (contact_id, inbox_id, source_id, created_at, updated_at) 
+		VALUES ($1, $2, gen_random_uuid(), to_timestamp($3), to_timestamp($4)) RETURNING id`
+	err = d.db.QueryRow(ciInsert, contactID, inboxID, createdAt, updatedAt).Scan(&contactInboxID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create contact_inbox: %w", err)
+	}
+	log.Printf("createContactAndConversation: Created contact_inbox_id=%d", contactInboxID)
+	
+	// Criar conversa
+	var conversationID int64
+	convInsert := `INSERT INTO conversations (account_id, inbox_id, status, contact_id, contact_inbox_id, uuid, last_activity_at, created_at, updated_at)
+		VALUES ($1, $2, 0, $3, $4, gen_random_uuid(), to_timestamp($5), to_timestamp($6), to_timestamp($7)) RETURNING id`
+	err = d.db.QueryRow(convInsert, d.cfg.Chatwoot.AccountID, inboxID, contactID, contactInboxID, updatedAt, createdAt, updatedAt).Scan(&conversationID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create conversation: %w", err)
+	}
+	log.Printf("createContactAndConversation: Created conversation_id=%d", conversationID)
+	
+	return &models.ChatwootFKs{
+		PhoneNumber:   contact.PhoneNumber,
+		ContactID:     int(contactID),
+		ConversationID: int(conversationID),
+	}, nil
 }
 
 // CheckExistingMessages verifica quais mensagens já existem

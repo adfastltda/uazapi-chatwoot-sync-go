@@ -158,9 +158,24 @@ func (s *Service) processChatsBatch(
 	}
 
 	log.Printf("Created/updated %d contacts and conversations", len(fksMap))
+	
+	if len(fksMap) == 0 {
+		log.Printf("WARNING: No FKs returned from CreateContactsAndConversations, but %d contacts were provided", len(contacts))
+		log.Printf("This might indicate that contacts already exist but query didn't return them, or query failed")
+		return fmt.Errorf("no contacts/conversations created or found")
+	}
 
 	// Processar mensagens para cada chat
 	for phoneNumber, fks := range fksMap {
+		if fks == nil {
+			log.Printf("WARNING: FK is nil for phone %s, skipping", phoneNumber)
+			continue
+		}
+		if fks.ContactID == 0 || fks.ConversationID == 0 {
+			log.Printf("WARNING: Invalid FK for phone %s: contact_id=%d, conversation_id=%d, skipping", 
+				phoneNumber, fks.ContactID, fks.ConversationID)
+			continue
+		}
 		select {
 		case <-s.stopChan:
 			return nil
