@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  chatwoot-sync:
+    build: .
+    container_name: chatwoot-sync
+    restart: unless-stopped
+    environment:
+      - UAZAPI_BASE_URL=${UAZAPI_BASE_URL}
+      - UAZAPI_TOKEN=${UAZAPI_TOKEN}
+      - CHATWOOT_DB_HOST=${CHATWOOT_DB_HOST}
+      - CHATWOOT_DB_PORT=${CHATWOOT_DB_PORT}
+      - CHATWOOT_DB_NAME=${CHATWOOT_DB_NAME}
+      - CHATWOOT_DB_USER=${CHATWOOT_DB_USER}
+      - CHATWOOT_DB_PASSWORD=${CHATWOOT_DB_PASSWORD}
+      - CHATWOOT_DB_SSLMODE=${CHATWOOT_DB_SSLMODE}
+      - CHATWOOT_ACCOUNT_ID=${CHATWOOT_ACCOUNT_ID}
+      - CHATWOOT_INBOX_ID=${CHATWOOT_INBOX_ID}
+      - CHATWOOT_INBOX_NAME=${CHATWOOT_INBOX_NAME}
+      - CHATWOOT_API_TOKEN=${CHATWOOT_API_TOKEN}
+      - SYNC_BATCH_SIZE=${SYNC_BATCH_SIZE}
+      - SYNC_LIMIT_CHATS=${SYNC_LIMIT_CHATS}
+      - SYNC_LIMIT_MESSAGES=${SYNC_LIMIT_MESSAGES}
+    networks:
+      - chatwoot-sync
+
+networks:
+  chatwoot-sync:
+    driver: bridge
+
