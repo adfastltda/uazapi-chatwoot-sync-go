@@ -12,12 +12,24 @@ import (
 	"sync"
 )
 
+type Stats struct {
+	TotalChatsProcessed    int
+	ChatsWithMessages      int
+	ChatsSkipped           int
+	TotalMessagesChecked   int
+	MessagesAlreadyExist   int
+	MessagesInserted       int
+	ContactsCreatedUpdated int
+}
+
 type Service struct {
 	cfg         *config.Config
 	uazapi      *uazapi.Client
 	chatwoot    *chatwoot.Database
 	stopChan    chan struct{}
 	wg          sync.WaitGroup
+	stats       Stats
+	statsMutex  sync.Mutex
 }
 
 func NewService(cfg *config.Config) *Service {
@@ -29,6 +41,9 @@ func NewService(cfg *config.Config) *Service {
 }
 
 func (s *Service) Start() error {
+	// Inicializar estatísticas
+	s.stats = Stats{}
+
 	// Conectar ao banco do Chatwoot
 	db, err := chatwoot.NewDatabase(s.cfg)
 	if err != nil {
@@ -66,6 +81,7 @@ func (s *Service) Start() error {
 		select {
 		case <-s.stopChan:
 			log.Println("Sync stopped by user")
+			s.printReport()
 			return nil
 		default:
 		}
@@ -84,6 +100,7 @@ func (s *Service) Start() error {
 		}
 	}
 
+	s.printReport()
 	log.Println("Sync completed successfully")
 	return nil
 }
@@ -97,11 +114,13 @@ func (s *Service) processChatsBatch(
 	contacts := make([]models.ChatwootContact, 0, len(chats))
 	chatMap := make(map[string]models.UAZAPIChat)
 	chatsWithMessages := make(map[string]bool)
+	skippedCount := 0
 
 	// Primeiro, verificar quais chats têm mensagens
 	log.Printf("Checking which chats have messages...")
 	for _, chat := range chats {
 		if chat.WAIsGroup || chat.Phone == "" {
+			skippedCount++
 			continue // Pular grupos e chats sem telefone
 		}
 
@@ -110,6 +129,7 @@ func (s *Service) processChatsBatch(
 			chatID = chat.WAChatLID
 		}
 		if chatID == "" {
+			skippedCount++
 			continue
 		}
 
@@ -117,16 +137,19 @@ func (s *Service) processChatsBatch(
 		messages, err := s.uazapi.GetAllMessages(chatID, s.cfg.Sync.LimitMessages)
 		if err != nil {
 			log.Printf("Warning: failed to check messages for chat %s: %v", chatID, err)
+			skippedCount++
 			continue
 		}
 
 		if len(messages) == 0 {
 			log.Printf("Skipping chat %s (phone: %s) - no messages", chatID, chat.Phone)
+			skippedCount++
 			continue // Ignorar chats sem mensagens
 		}
 
 		phoneNumber := s.normalizePhoneNumber(chat.Phone)
 		if phoneNumber == "" {
+			skippedCount++
 			continue
 		}
 
@@ -143,12 +166,17 @@ func (s *Service) processChatsBatch(
 		chatMap[phoneNumber] = chat
 	}
 
+	// Atualizar estatísticas
+	s.addStatsChatsProcessed(len(chats))
+	s.addStatsChatsSkipped(skippedCount)
+
 	if len(contacts) == 0 {
 		log.Printf("No chats with messages to process")
 		return nil
 	}
 
 	log.Printf("Found %d chats with messages out of %d total chats", len(contacts), len(chats))
+	s.addStatsChatsWithMessages(len(contacts))
 
 	// Criar contatos e conversas apenas para chats com mensagens
 	log.Printf("Creating/updating %d contacts and conversations...", len(contacts))
@@ -158,6 +186,7 @@ func (s *Service) processChatsBatch(
 	}
 
 	log.Printf("Created/updated %d contacts and conversations", len(fksMap))
+	s.addStatsContactsCreatedUpdated(len(fksMap))
 	
 	if len(fksMap) == 0 {
 		log.Printf("WARNING: No FKs returned from CreateContactsAndConversations, but %d contacts were provided", len(contacts))
@@ -226,6 +255,7 @@ func (s *Service) syncChatMessages(
 	}
 
 	log.Printf("Processing %d total messages for chat %s", len(messages), chatID)
+	s.addStatsMessagesChecked(len(messages))
 
 	// Verificar mensagens existentes
 	sourceIDs := make([]string, 0, len(messages))
@@ -239,6 +269,7 @@ func (s *Service) syncChatMessages(
 	}
 
 	log.Printf("Found %d existing messages out of %d total for chat %s", len(existing), len(messages), chatID)
+	s.addStatsMessagesAlreadyExist(len(existing))
 
 	// Filtrar apenas mensagens novas
 	newMessages := make([]models.ChatwootMessage, 0)
@@ -315,6 +346,7 @@ func (s *Service) syncChatMessages(
 	}
 	log.Printf("Successfully inserted %d messages for conversation %d", 
 		totalInserted, fks.ConversationID)
+	s.addStatsMessagesInserted(totalInserted)
 
 	// Atualizar última atividade
 	if lastTimestamp > 0 {
@@ -372,6 +404,67 @@ func (s *Service) extractMessageContent(msg models.UAZAPIMessage) string {
 		return msg.Text
 	}
 	return msg.MessageType
+}
+
+func (s *Service) printReport() {
+	s.statsMutex.Lock()
+	defer s.statsMutex.Unlock()
+
+	log.Println("")
+	log.Println("========================================")
+	log.Println("        RELATÓRIO DE SINCRONIZAÇÃO")
+	log.Println("========================================")
+	log.Printf("Total de chats processados:        %d", s.stats.TotalChatsProcessed)
+	log.Printf("Chats com mensagens:               %d", s.stats.ChatsWithMessages)
+	log.Printf("Chats ignorados (sem mensagens):   %d", s.stats.ChatsSkipped)
+	log.Printf("Total de mensagens verificadas:    %d", s.stats.TotalMessagesChecked)
+	log.Printf("Mensagens já existentes:           %d", s.stats.MessagesAlreadyExist)
+	log.Printf("Mensagens novas inseridas:         %d", s.stats.MessagesInserted)
+	log.Printf("Contatos criados/atualizados:      %d", s.stats.ContactsCreatedUpdated)
+	log.Println("========================================")
+	log.Println("")
+}
+
+func (s *Service) addStatsChatsProcessed(count int) {
+	s.statsMutex.Lock()
+	defer s.statsMutex.Unlock()
+	s.stats.TotalChatsProcessed += count
+}
+
+func (s *Service) addStatsChatsWithMessages(count int) {
+	s.statsMutex.Lock()
+	defer s.statsMutex.Unlock()
+	s.stats.ChatsWithMessages += count
+}
+
+func (s *Service) addStatsChatsSkipped(count int) {
+	s.statsMutex.Lock()
+	defer s.statsMutex.Unlock()
+	s.stats.ChatsSkipped += count
+}
+
+func (s *Service) addStatsMessagesChecked(count int) {
+	s.statsMutex.Lock()
+	defer s.statsMutex.Unlock()
+	s.stats.TotalMessagesChecked += count
+}
+
+func (s *Service) addStatsMessagesAlreadyExist(count int) {
+	s.statsMutex.Lock()
+	defer s.statsMutex.Unlock()
+	s.stats.MessagesAlreadyExist += count
+}
+
+func (s *Service) addStatsMessagesInserted(count int) {
+	s.statsMutex.Lock()
+	defer s.statsMutex.Unlock()
+	s.stats.MessagesInserted += count
+}
+
+func (s *Service) addStatsContactsCreatedUpdated(count int) {
+	s.statsMutex.Lock()
+	defer s.statsMutex.Unlock()
+	s.stats.ContactsCreatedUpdated += count
 }
 
 func (s *Service) Stop() {
